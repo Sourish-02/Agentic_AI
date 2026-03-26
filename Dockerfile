@@ -12,9 +12,6 @@ RUN pip install --no-cache-dir \
     pydantic>=2.11.4 \
     python-dotenv>=1.1.0 \
     uvicorn>=0.34.2
-    # Add your custom dependencies here
-    # requests>=2.31.0 \
-    # beautifulsoup4>=4.12.0
 
 ENV PYTHONUNBUFFERED=1
 

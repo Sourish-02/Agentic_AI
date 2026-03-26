@@ -1,13 +1,12 @@
 services:
-  {{AGENT_CONTAINER_NAME}}:
+  data-pipeline-container:
     build: .
-    container_name: {{AGENT_CONTAINER_NAME}}
-    environment:
-      - OPENAI_API_KEY=your-openai-api-key-here
-      # Add your custom environment variables here
+    container_name: data-pipeline-container
+    env_file:
+      - .env
     stdin_open: true
     ports:
-      - "5000"
+      - "5001:5000"
     tty: true
     networks:
       - agents-net
