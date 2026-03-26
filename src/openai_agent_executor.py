@@ -26,19 +26,20 @@ class OpenAIAgentExecutor(AgentExecutor):
     """An AgentExecutor that runs an OpenAI-based Agent."""
 
     def __init__(
-        self,
-        card: AgentCard,
-        tools: dict[str, Any],
-        api_key: str,
-        system_prompt: str,
-    ):
-        self._card = card
-        self.tools = tools
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-        )
-        self.model = 'gpt-4o'
-        self.system_prompt = system_prompt
+            self,
+            card: AgentCard,
+            tools: dict[str, Any],
+            api_key: str,
+            system_prompt: str,
+        ):
+            self._card = card
+            self.tools = tools
+            self.client = AsyncOpenAI(
+                api_key=api_key,
+                base_url="https://api.groq.com/openai/v1", # <-- Reroutes to Groq!
+            )
+            self.model = 'llama-3.3-70b-versatile' # <-- Groq's tool-calling model
+            self.system_prompt = system_prompt
 
     async def _process_request(
         self,
@@ -67,16 +68,18 @@ class OpenAIAgentExecutor(AgentExecutor):
             iteration += 1
 
             try:
-                # Make API call to OpenAI
+               # Make API call to Groq
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    tools=openai_tools if openai_tools else None,
-                    tool_choice='auto' if openai_tools else None,
+                    # If there are no tools, don't pass the tools or tool_choice keys at all
+                    **(
+                        {"tools": openai_tools, "tool_choice": "auto"} 
+                        if openai_tools else {}
+                    ),
                     temperature=0.1,
                     max_tokens=4000,
                 )
-
                 message = response.choices[0].message
 
                 # Add assistant's response to messages

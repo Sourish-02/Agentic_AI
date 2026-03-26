@@ -29,9 +29,9 @@ logging.basicConfig()
 @click.option('--host', 'host', default='localhost')
 @click.option('--port', 'port', default=5000)
 def main(host: str, port: int):
-    # Verify an API key is set.
-    if not os.getenv('OPENAI_API_KEY'):
-        raise ValueError('OPENAI_API_KEY environment variable not set')
+    # Verify the Groq API key is set.
+    if not os.getenv('GROQ_API_KEY'):
+        raise ValueError('GROQ_API_KEY environment variable not set')
 
     skill = AgentSkill(
         id='data_pipeline_orchestrator',
@@ -44,7 +44,7 @@ def main(host: str, port: int):
         ],
     )
 
-    # AgentCard for OpenAI-based agent
+    # AgentCard for the agent
     agent_card = AgentCard(
         name='data-pipeline-agent',
         description='An autonomous agent that manages end-to-end data pipeline workflows, handles API failures gracefully, and delivers summary reports.',
@@ -56,13 +56,13 @@ def main(host: str, port: int):
         skills=[skill],
     )
 
-    # Create OpenAI agent
+    # Create agent
     agent_data = create_agent()
 
     agent_executor = OpenAIAgentExecutor(
         card=agent_card,
         tools=agent_data['tools'],
-        api_key=os.getenv('OPENAI_API_KEY'),
+        api_key=os.getenv('GROQ_API_KEY'),  # <-- Now passing the Groq key
         system_prompt=agent_data['system_prompt'],
     )
 
