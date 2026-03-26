@@ -249,7 +249,7 @@ class OpenAIAgentExecutor(AgentExecutor):
                 message_text += part.root.text
 
         await self._process_request(message_text, context, updater)
-        logger.debug('[{{AGENT_NAME}}] execute exiting')
+        logger.debug('[data-pipeline-agent] execute exiting')
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
         # Ideally: kill any ongoing tasks.

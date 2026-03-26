@@ -34,17 +34,20 @@ def main(host: str, port: int):
         raise ValueError('OPENAI_API_KEY environment variable not set')
 
     skill = AgentSkill(
-        id='{{AGENT_SKILL_ID}}',
-        name='{{AGENT_SKILL_NAME}}',
-        description='{{AGENT_SKILL_DESCRIPTION}}',
-        tags={{AGENT_TAGS}},
-        examples={{AGENT_EXAMPLES}},
+        id='data_pipeline_orchestrator',
+        name='Data Pipeline Orchestrator',
+        description='Orchestrates multi-step data workflows: fetching, cleaning, charting, and emailing reports with automatic error recovery.',
+        tags=['pipeline', 'data', 'reporting'],
+        examples=[
+            "Fetch Q3 sales data from v2_api, transform it using standard strategy, create a bar chart, compose a report, and email it to team@company.com.",
+            "Pull historical records from legacy_api, clean the data using drop_corrupt, generate a line chart, and email ops@company.com."
+        ],
     )
 
     # AgentCard for OpenAI-based agent
     agent_card = AgentCard(
-        name='{{AGENT_NAME}}',
-        description='{{AGENT_DESCRIPTION}}',
+        name='data-pipeline-agent',
+        description='An autonomous agent that manages end-to-end data pipeline workflows, handles API failures gracefully, and delivers summary reports.',
         url=f'http://{host}:{port}/',
         version='1.0.0',
         default_input_modes=['text'],
