@@ -1,8 +1,9 @@
 import json
 import logging
 import inspect
-
-from typing import Any
+import os
+from collections import defaultdict
+from typing import Any, List
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
@@ -21,239 +22,232 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-
 class OpenAIAgentExecutor(AgentExecutor):
-    """An AgentExecutor that runs an OpenAI-based Agent."""
+    """
+    An AgentExecutor that manages persistent sessions and recovers 
+    intelligently from pauses/HITL events.
+    """
 
-    def __init__(
-            self,
-            card: AgentCard,
-            tools: dict[str, Any],
-            api_key: str,
-            system_prompt: str,
-        ):
-            self._card = card
-            self.tools = tools
-            self.client = AsyncOpenAI(
-                api_key=api_key,
-                base_url="https://api.groq.com/openai/v1", # <-- Reroutes to Groq!
+    def __init__(self, card: AgentCard, tools: dict[str, Any], api_key: str, system_prompt: str):
+        self._card = card
+        self.tools = tools
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "http://localhost:8080", "X-Title": "A2A Data Agent"}
+        )
+        self.model = 'openai/gpt-4o-mini'
+        self.system_prompt = system_prompt
+        
+        # PERSISTENCE: Path to store conversation history
+        self.sessions_file = "sessions.json"
+        self.sessions = self._load_sessions()
+
+    def _load_sessions(self):
+        """Loads sessions from a JSON file to persist state across restarts."""
+        if os.path.exists(self.sessions_file):
+            try:
+                with open(self.sessions_file, 'r') as f:
+                    data = json.load(f)
+                    return defaultdict(list, data)
+            except Exception as e:
+                logger.error(f"Failed to load sessions: {e}")
+        return defaultdict(list)
+
+    def _save_sessions(self):
+        """Saves history to JSON. Essential for the agent to remember after pausing."""
+        try:
+            with open(self.sessions_file, 'w') as f:
+                json.dump(dict(self.sessions), f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save sessions: {e}")
+
+    async def _process_request(self, message_text: str, context: RequestContext, task_updater: TaskUpdater) -> None:
+        session_id = str(context.context_id)
+        
+        # Check if we are resuming a paused session
+        is_resuming = session_id in self.sessions and len(self.sessions[session_id]) > 1
+        
+        if not is_resuming:
+            self.sessions[session_id] = [{'role': 'system', 'content': self.system_prompt}]
+        else:
+            # IRONCLAD RESUMPTION NOTICE: Injected right before user input
+            resumption_msg = (
+                "CRITICAL RESUMPTION NOTICE: You are continuing a paused session. "
+                "Look at your history. DO NOT call 'submit_plan'. DO NOT call any tool "
+                "that has already returned a successful result. "
+                "The human has provided guidance. Use it to call the NEXT tool in the sequence."
             )
-            self.model = 'llama-3.3-70b-versatile' # <-- Groq's tool-calling model
-            self.system_prompt = system_prompt
+            self.sessions[session_id].append({'role': 'system', 'content': resumption_msg})
 
-    async def _process_request(
-        self,
-        message_text: str,
-        context: RequestContext,
-        task_updater: TaskUpdater,
-    ) -> None:
-        messages = [
-            {'role': 'system', 'content': self.system_prompt},
-            {'role': 'user', 'content': message_text},
-        ]
+        # Append user instruction and save immediately
+        self.sessions[session_id].append({'role': 'user', 'content': message_text})
+        self._save_sessions()
+        
+        messages = self.sessions[session_id]
+        
+        # Determine if we force submit_plan or let the LLM choose (auto)
+        is_new_session = not is_resuming
 
-        # Convert tools to OpenAI format
-        openai_tools = []
-        for tool_name, tool_instance in self.tools.items():
-            if hasattr(tool_instance, tool_name):
-                func = getattr(tool_instance, tool_name)
-                # Extract function schema from the method
-                schema = self._extract_function_schema(func)
-                openai_tools.append({'type': 'function', 'function': schema})
-
-        max_iterations = 10
+        openai_tools = [{'type': 'function', 'function': self._extract_function_schema(f)} for f in self.tools.values()]
         iteration = 0
+        tool_retries = defaultdict(int)
 
-        while iteration < max_iterations:
+        while iteration < 20:
             iteration += 1
+            
+            # Forced Tool Choice Logic
+            current_tool_choice = "auto"
+            if is_new_session and iteration == 1:
+                current_tool_choice = {"type": "function", "function": {"name": "submit_plan"}}
 
             try:
-               # Make API call to Groq
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    # If there are no tools, don't pass the tools or tool_choice keys at all
-                    **(
-                        {"tools": openai_tools, "tool_choice": "auto"} 
-                        if openai_tools else {}
-                    ),
-                    temperature=0.1,
-                    max_tokens=4000,
+                    tools=openai_tools,
+                    tool_choice=current_tool_choice,
+                    temperature=0.1
                 )
+                
                 message = response.choices[0].message
+                messages.append({
+                    'role': 'assistant', 
+                    'content': message.content, 
+                    'tool_calls': [t.model_dump() for t in message.tool_calls] if message.tool_calls else None
+                })
+                self._save_sessions()
 
-                # Add assistant's response to messages
-                messages.append(
-                    {
-                        'role': 'assistant',
-                        'content': message.content,
-                        'tool_calls': message.tool_calls,
-                    }
-                )
-
-                # Check if there are tool calls to execute
                 if message.tool_calls:
-                    # Execute tool calls
                     for tool_call in message.tool_calls:
                         function_name = tool_call.function.name
                         function_args = json.loads(tool_call.function.arguments)
 
-                        logger.debug(
-                            f'Calling function: {function_name} with args: {function_args}'
-                        )
+                        # AUTOCORRECT: Fixes LLM formatting errors for list types
+                        if function_name == 'submit_plan' and isinstance(function_args.get('steps'), str):
+                            raw_steps = function_args['steps'].split('\n')
+                            function_args['steps'] = [s.strip().lstrip('0123456789. ') for s in raw_steps if s.strip()]
 
-                        # Execute the function
+                        logger.debug(f'Iteration {iteration}: Executing {function_name}')
+
                         if function_name in self.tools:
-                            tool_instance = self.tools[function_name]
-                            # Get the method from the instance
-                            if hasattr(tool_instance, function_name):
-                                method = getattr(tool_instance, function_name)
-                                result = method(**function_args)
-                                # Check if the result is a coroutine and await it
+                            func = self.tools[function_name]
+                            try:
+                                result = func(**function_args)
                                 if inspect.iscoroutine(result):
                                     result = await result
+                                
+                                # Process tool output
+                                if hasattr(result, 'model_dump'):
+                                    res_dict = result.model_dump()
+                                elif isinstance(result, dict):
+                                    res_dict = result
+                                else:
+                                    res_dict = {"status": "success", "result": str(result)}
+                                res_json = json.dumps(res_dict)
+                            except Exception as e:
+                                res_json = json.dumps({"status": "error", "message": str(e)})
+                        else:
+                            res_json = json.dumps({"status": "error", "message": f"Tool {function_name} not found"})
+
+                        messages.append({'role': 'tool', 'tool_call_id': tool_call.id, 'content': res_json})
+                        self._save_sessions()
+
+                        # HITL EXIT: Return control to user if pause tool is called
+                        if function_name == 'request_human_input':
+                            logger.info("Session paused via tool call.")
+                            await task_updater.add_artifact([TextPart(text=res_json)])
+                            await task_updater.complete()
+                            return 
+
+                        # Retry Logic - FIXED: Now checks 'status' field specifically
+                        try:
+                            # Parse the JSON and check for explicit error status
+                            res_obj = json.loads(res_json)
+                            is_error = res_obj.get("status") == "error"
+                        except:
+                            # Fallback if result isn't JSON
+                            is_error = "error" in res_json.lower()
+
+                        if is_error and function_name != 'escalate':
+                            tool_retries[function_name] += 1
+                            if tool_retries[function_name] >= 2:
+                                messages.append({
+                                    'role': 'system', 
+                                    'content': f"NOTIFICATION: '{function_name}' has failed {tool_retries[function_name]} times. DO NOT call escalate. You MUST call 'request_human_input' to ask the user for help."
+                                })
                             else:
-                                result = {
-                                    'error': f'Method {function_name} not found on tool instance'
-                                }
-                        else:
-                            result = {
-                                'error': f'Function {function_name} not found'
-                            }
+                                messages.append({
+                                    'role': 'system', 
+                                    'content': f"NOTIFICATION: '{function_name}' failed. Modify parameters and retry."
+                                })
+                            self._save_sessions()
 
-                        # Serialize result properly - handle Pydantic models
-                        if hasattr(result, 'model_dump'):
-                            # It's a Pydantic model, use model_dump() to convert to dict
-                            result_json = json.dumps(result.model_dump())
-                        elif isinstance(result, dict):
-                            # It's a regular dict
-                            result_json = json.dumps(result)
-                        else:
-                            # Convert to string as fallback
-                            result_json = str(result)
-
-                        # Add tool result to messages
-                        messages.append(
-                            {
-                                'role': 'tool',
-                                'tool_call_id': tool_call.id,
-                                'content': result_json,
-                            }
-                        )
-
-                    # Send update to show we're processing
-                    await task_updater.update_status(
-                        TaskState.working,
-                        message=task_updater.new_agent_message(
-                            [TextPart(text='Processing tool calls...')]
-                        ),
-                    )
-
-                    # Continue the loop to get the final response
+                    await task_updater.update_status(TaskState.working)
                     continue
-                # No more tool calls, this is the final response
+                
                 if message.content:
-                    parts = [TextPart(text=message.content)]
-                    logger.debug(f'Yielding final response: {parts}')
-                    await task_updater.add_artifact(parts)
+                    await task_updater.add_artifact([TextPart(text=message.content)])
                     await task_updater.complete()
                 break
 
             except Exception as e:
-                logger.error(f'Error in OpenAI API call: {e}')
-                error_parts = [
-                    TextPart(
-                        text=f'Sorry, an error occurred while processing the request: {e!s}'
-                    )
-                ]
-                await task_updater.add_artifact(error_parts)
+                logger.error(f'System failure: {e}')
+                await task_updater.add_artifact([TextPart(text=f'{{"status": "ERROR", "message": "{e!s}"}}')])
                 await task_updater.complete()
                 break
 
-        if iteration >= max_iterations:
-            error_parts = [
-                TextPart(
-                    text='Sorry, the request has exceeded the maximum number of iterations.'
-                )
-            ]
-            await task_updater.add_artifact(error_parts)
-            await task_updater.complete()
-
     def _extract_function_schema(self, func):
-        """Extract OpenAI function schema from a Python function"""
-        import inspect
-
-        # Get function signature
+        """Extracts JSON Schema from a Python function, ensuring list types are correctly typed as arrays."""
         sig = inspect.signature(func)
-
-        # Get docstring
-        docstring = inspect.getdoc(func) or ''
-
-        # Extract description and parameter info from docstring
-        lines = docstring.split('\n')
-        description = lines[0] if lines else func.__name__
-
-        # Build parameters schema
+        docstring = (inspect.getdoc(func) or func.__name__).split('\n')[0]
+        
         properties = {}
         required = []
 
-        for param_name, param in sig.parameters.items():
-            param_type = 'string'  # Default type
-            param_description = f'Parameter {param_name}'
-
-            # Try to infer type from annotation
+        for name, param in sig.parameters.items():
+            param_type = 'string'
             if param.annotation != inspect.Parameter.empty:
-                if param.annotation == int:
-                    param_type = 'integer'
-                elif param.annotation == float:
-                    param_type = 'number'
-                elif param.annotation == bool:
-                    param_type = 'boolean'
-                elif param.annotation == list:
+                ann_str = str(param.annotation).lower()
+                if param.annotation == int: param_type = 'integer'
+                elif param.annotation == bool: param_type = 'boolean'
+                elif 'list' in ann_str:
                     param_type = 'array'
-                elif param.annotation == dict:
-                    param_type = 'object'
-
-            # Check if parameter has default value
+            
+            prop = {'type': param_type, 'description': f'Input for {name}'}
+            if param_type == 'array':
+                prop['items'] = {'type': 'string'}
+                
+            properties[name] = prop
             if param.default == inspect.Parameter.empty:
-                required.append(param_name)
-
-            properties[param_name] = {
-                'type': param_type,
-                'description': param_description,
-            }
+                required.append(name)
 
         return {
             'name': func.__name__,
-            'description': description,
+            'description': docstring,
             'parameters': {
                 'type': 'object',
                 'properties': properties,
-                'required': required,
-            },
+                'required': required
+            }
         }
 
-    async def execute(
-        self,
-        context: RequestContext,
-        event_queue: EventQueue,
-    ):
-        # Run the agent until complete
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        # Immediately notify that the task is submitted.
-        if not context.current_task:
-            await updater.submit()
+        if not context.current_task: await updater.submit()
         await updater.start_work()
+        
+        # Combined text part extraction
+        text_parts = []
+        for p in context.message.parts:
+            # Handle different SDK versions for text access
+            if hasattr(p, 'root') and hasattr(p.root, 'text'):
+                text_parts.append(p.root.text)
+            elif hasattr(p, 'text'):
+                text_parts.append(p.text)
+                
+        text = "".join(text_parts)
+        await self._process_request(text, context, updater)
 
-        # Extract text from message parts
-        message_text = ''
-        for part in context.message.parts:
-            if isinstance(part.root, TextPart):
-                message_text += part.root.text
-
-        await self._process_request(message_text, context, updater)
-        logger.debug('[data-pipeline-agent] execute exiting')
-
-    async def cancel(self, context: RequestContext, event_queue: EventQueue):
-        # Ideally: kill any ongoing tasks.
+    async def cancel(self, context, event_queue): 
         raise ServerError(error=UnsupportedOperationError())

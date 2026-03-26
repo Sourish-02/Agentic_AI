@@ -1,21 +1,21 @@
+import pandas as pd
+import matplotlib
+# Use 'Agg' backend for headless Docker environments
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
 import json
-from typing import Any, List, Optional
+import logging
+from typing import List, Optional, Any
 from pydantic import BaseModel
 
-# ==========================================
-# PYDANTIC RESPONSE MODELS
-# ==========================================
+logger = logging.getLogger(__name__)
 
-class FetchResponse(BaseModel):
-    status: str
-    data: Optional[List[dict]] = None
-    message: Optional[str] = None
-    code: Optional[int] = None
+# --- Pydantic Models for Tool Outputs ---
 
-class TransformResponse(BaseModel):
+class DataResponse(BaseModel):
     status: str
-    transformed_data: Optional[List[dict]] = None
-    count: Optional[int] = None
+    data: Optional[list] = None
     message: Optional[str] = None
 
 class ChartResponse(BaseModel):
@@ -26,150 +26,141 @@ class ChartResponse(BaseModel):
 class ReportResponse(BaseModel):
     status: str
     report_content: Optional[str] = None
-    message: Optional[str] = None
 
-class DispatchResponse(BaseModel):
+class EmailResponse(BaseModel):
     status: str
     message: str
 
-class EscalateResponse(BaseModel):
+class HumanInputResponse(BaseModel):
     status: str
-    message: str
+    reason: str
+    question: str
 
-
-# ==========================================
-# TOOLSET IMPLEMENTATION
-# ==========================================
+# --- The Toolset Implementation ---
 
 class DataPipelineToolset:
-    """Tools for fetching, transforming data, and generating reports."""
-
     def __init__(self):
-        # State tracker to simulate transient failures
         self.fetch_attempts = 0
 
-    def fetch_data(self, source: str, query: str) -> FetchResponse:
-        """
-        Fetches data from a specified source.
-        
-        Args:
-            source: The API or database source (e.g., 'sales_db', 'legacy_api', 'v2_api').
-            query: The data query or timeframe.
-        """
+    def submit_plan(self, steps: List[str]) -> dict:
+        """Submit the execution plan for the data pipeline."""
+        return {"status": "success", "message": "Plan accepted", "planned_steps": steps}
+
+    def fetch_data(self, source: str, query: str) -> DataResponse:
+        """Fetches raw data. Simulates a 429 Rate Limit on the first attempt."""
         self.fetch_attempts += 1
         
         if self.fetch_attempts == 1:
-            return FetchResponse(
-                status="error", 
-                code=429, 
-                message="Rate limit exceeded. Try again."
-            )
-            
-        if source == "legacy_api":
-             return FetchResponse(
-                 status="error", 
-                 message="Source 'legacy_api' is deprecated. Use 'v2_api'."
-             )
-
-        mock_data = [
+            logger.warning("Simulating 429 Rate Limit Error")
+            return DataResponse(status="error", message="429 Too Many Requests from v2_api")
+        
+        raw_data = [
             {"region": "North", "sales": 15000, "status": "clean"},
             {"region": "South", "sales": 12000, "status": "clean"},
-            {"region": "East", "sales": "ERROR_NAN", "status": "corrupt"} 
+            {"region": "East", "sales": "ERROR_NAN", "status": "corrupt"}
         ]
-        return FetchResponse(status="success", data=mock_data)
+        return DataResponse(status="success", data=raw_data)
 
-    def transform_data(self, raw_data_json: str, strategy: str = "standard") -> TransformResponse:
-        """
-        Cleans and transforms raw data.
-        
-        Args:
-            raw_data_json: The JSON string of data to transform.
-            strategy: 'standard' or 'drop_corrupt'.
-        """
+    def _peel_data(self, input_val: Any) -> list:
+        """Internal helper to extract a list of data from wrapped LLM inputs."""
         try:
-            data = json.loads(raw_data_json)
-            if not isinstance(data, list):
-                return TransformResponse(status="error", message="Expected a list of records.")
-
-            cleaned_data = []
-            for row in data:
-                if row.get("status") == "corrupt":
-                    if strategy == "standard":
-                        return TransformResponse(
-                            status="error", 
-                            message="Malformed data encountered. Use strategy='drop_corrupt' to bypass."
-                        )
-                    else:
-                        continue 
-                cleaned_data.append(row)
+            # If it's a string, try to parse it
+            data = json.loads(input_val) if isinstance(input_val, str) else input_val
+            
+            # If the LLM passed the whole response dictionary, grab just the 'data' part
+            if isinstance(data, dict):
+                if "data" in data:
+                    return data["data"]
+                if "result" in data:
+                    return data["result"]
+            
+            # If it's already a list, we're good
+            if isinstance(data, list):
+                return data
                 
-            return TransformResponse(
-                status="success", 
-                transformed_data=cleaned_data, 
-                count=len(cleaned_data)
-            )
+            return []
+        except:
+            return []
+
+    def transform_data(self, raw_data_json: str, strategy: str) -> DataResponse:
+        """Cleans data using pandas based on a strategy."""
+        try:
+            # Peel the data out of potential wrappers
+            data_list = self._peel_data(raw_data_json)
+            if not data_list:
+                return DataResponse(status="error", message="Could not find valid data list in input")
+
+            df = pd.DataFrame(data_list)
+            
+            if strategy == "drop_corrupt":
+                # Ensure sales is numeric and drop the NaNs created by ERROR_NAN
+                df['sales'] = pd.to_numeric(df['sales'], errors='coerce')
+                df = df.dropna(subset=['sales'])
+            
+            clean_json = df.to_json(orient="records")
+            return DataResponse(status="success", data=json.loads(clean_json))
         except Exception as e:
-            return TransformResponse(status="error", message=f"JSON parsing failed: {str(e)}")
+            logger.error(f"Pandas transformation failed: {e}")
+            return DataResponse(status="error", message=f"Pandas transformation failed: {str(e)}")
 
     def generate_chart(self, transformed_data_json: str, chart_type: str) -> ChartResponse:
-        """
-        Generates a summary chart.
-        
-        Args:
-            transformed_data_json: The JSON string of clean data.
-            chart_type: e.g., 'bar', 'line', 'pie'.
-        """
-        if chart_type not in ["bar", "line", "pie"]:
-            return ChartResponse(status="error", message="Unsupported chart type.")
+        """Generates a real PNG chart using matplotlib."""
+        try:
+            # Peel the data out of potential wrappers
+            data_list = self._peel_data(transformed_data_json)
+            if not data_list:
+                return ChartResponse(status="error", message="No data available to generate chart")
+
+            df = pd.DataFrame(data_list)
             
-        return ChartResponse(
-            status="success", 
-            chart_url=f"https://mock-charts.com/generated_{chart_type}_chart.png"
-        )
+            plt.figure(figsize=(8, 6))
+            if chart_type.lower() == "bar":
+                plt.bar(df['region'], df['sales'], color='skyblue')
+            elif chart_type.lower() == "pie":
+                plt.pie(df['sales'], labels=df['region'], autopct='%1.1f%%')
+            else:
+                return ChartResponse(status="error", message=f"Unsupported chart: {chart_type}")
+
+            plt.title(f"Sales Distribution ({chart_type.title()})")
+            
+            # Explicit path to ensure it lands in the mapped volume
+            file_path = "/app/pipeline_chart.png"
+            plt.savefig(file_path)
+            plt.close()
+
+            logger.info(f"Chart successfully saved to {file_path}")
+            return ChartResponse(status="success", chart_url="pipeline_chart.png")
+        except Exception as e:
+            logger.error(f"Matplotlib failed: {e}")
+            return ChartResponse(status="error", message=f"Matplotlib failed: {str(e)}")
 
     def compose_report(self, summary_text: str, chart_url: str) -> ReportResponse:
-        """
-        Composes a formatted markdown report.
-        
-        Args:
-            summary_text: Brief text summary of the data.
-            chart_url: The URL of the generated chart.
-        """
+        """Composes a markdown report."""
         report = f"# Pipeline Summary Report\n\n{summary_text}\n\n![Chart]({chart_url})"
         return ReportResponse(status="success", report_content=report)
 
-    def dispatch_email(self, report_content: str, recipient: str) -> DispatchResponse:
-        """
-        Dispatches the composed report to the recipient.
-        
-        Args:
-            report_content: The formatted markdown report.
-            recipient: The email address.
-        """
-        if "@" not in recipient:
-            return DispatchResponse(status="error", message="Invalid email format.")
-            
-        return DispatchResponse(status="success", message=f"Email successfully sent to {recipient}")
+    def dispatch_email(self, report_content: str, recipient: str) -> EmailResponse:
+        """Simulates sending the report via email."""
+        logger.info(f"Emailing report to {recipient}")
+        return EmailResponse(status="success", message=f"Email successfully sent to {recipient}")
 
-    def escalate(self, reason: str, failed_step: str) -> EscalateResponse:
-        """
-        Triggers an escalation if a step fails after maximum retries.
-        
-        Args:
-            reason: Why the workflow is being escalated.
-            failed_step: The name of the step that failed.
-        """
-        return EscalateResponse(
-            status="escalated", 
-            message=f"Workflow halted at {failed_step}. Human intervention required: {reason}"
-        )
+    def request_human_input(self, reason: str, question: str) -> HumanInputResponse:
+        """Pauses the workflow to ask the user a question."""
+        return HumanInputResponse(status="paused", reason=reason, question=question)
 
-    def get_tools(self) -> dict[str, Any]:
-        return {
-            'fetch_data': self.fetch_data,
-            'transform_data': self.transform_data,
-            'generate_chart': self.generate_chart,
-            'compose_report': self.compose_report,
-            'dispatch_email': self.dispatch_email,
-            'escalate': self.escalate,
-        }
+    def escalate(self, reason: str, failed_step: str) -> dict:
+        """Halt the workflow and notify the user of a critical failure."""
+        return {"status": "escalated", "message": f"Workflow halted at {failed_step}: {reason}"}
+
+def get_tools():
+    ts = DataPipelineToolset()
+    return {
+        "submit_plan": ts.submit_plan,
+        "fetch_data": ts.fetch_data,
+        "transform_data": ts.transform_data,
+        "generate_chart": ts.generate_chart,
+        "compose_report": ts.compose_report,
+        "dispatch_email": ts.dispatch_email,
+        "request_human_input": ts.request_human_input,
+        "escalate": ts.escalate
+    }
