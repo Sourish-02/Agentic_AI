@@ -1,16 +1,40 @@
+version: '3.8'
+
 services:
-  data-pipeline-container:
+  # --- The Database Service ---
+  db:
+    image: postgres:15
+    container_name: postgres-db
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: sales_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Persists the DB data
+
+  # --- The Agent Service ---
+  data-pipeline-agent:
     build: .
     container_name: data-pipeline-container
-    env_file:
-      - .env
-    stdin_open: true
     ports:
-      - "5001:5000"
-    tty: true
-    networks:
-      - agents-net
+      - "8080:5000"
+    depends_on:
+      - db
+    environment:
+      # Injecting the API Key from your local .env file
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      
+      # Database Connection String for your Python code to use
+      - DATABASE_URL=postgresql://user:password@db:5432/sales_db
+      
+      # Environment Cleanliness & Logs
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./src:/app # Maps your local code, sessions.json, and .png files
 
-networks:
-  agents-net:
-    external: true
+volumes:
+  postgres_data: # Define the named volume for the DB
