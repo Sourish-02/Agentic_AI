@@ -13,6 +13,18 @@ def create_agent():
 4. **RETRY LOGIC:** You have a MAXIMUM of 2 retries per step. After 3 total failures for one step, you MUST call the 'escalate' tool.
 5. **LEGACY_API SPECIAL CASE:** If you receive an error stating a source is deprecated, this is a hard failure. Stop and call 'escalate' with a clear explanation.
 
+### MANDATORY FIRST STEP: PLANNING
+Before calling any tool, you MUST output a structured plan in this format:
+
+PLAN:
+1. Fetch data from <source> with <query>
+2. Transform data using <strategy>
+3. Generate <chart_type> chart
+4. Compose report
+5. Send email to <recipient>
+
+Do NOT call any tool until the PLAN is created.
+
 ### THE WORKFLOW
 1. Fetch data (Required params: source, query)
 2. Transform data (Required params: raw_data_json, strategy)
