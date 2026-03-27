@@ -1,13 +1,17 @@
 import pandas as pd
 import matplotlib
-# Use 'Agg' backend for headless Docker environments
+# Use 'Agg' backend for headless cloud environments
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 import json
 import logging
+import os
+import base64
+import sqlite3
 from typing import List, Optional, Any
 from pydantic import BaseModel
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -18,149 +22,195 @@ class DataResponse(BaseModel):
     data: Optional[list] = None
     message: Optional[str] = None
 
+class AnalysisResponse(BaseModel):
+    status: str
+    analysis: Optional[str] = None
+    message: Optional[str] = None
+
 class ChartResponse(BaseModel):
     status: str
     chart_url: Optional[str] = None
     message: Optional[str] = None
-
-class ReportResponse(BaseModel):
-    status: str
-    report_content: Optional[str] = None
-
-class EmailResponse(BaseModel):
-    status: str
-    message: str
 
 class HumanInputResponse(BaseModel):
     status: str
     reason: str
     question: str
 
+class SchemaResponse(BaseModel):
+    status: str
+    schema: Optional[dict] = None
+    message: Optional[str] = None
+
 # --- The Toolset Implementation ---
 
 class DataPipelineToolset:
     def __init__(self):
-        self.fetch_attempts = 0
+        # Initialize OpenRouter client for Vision tasks
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY")
+        )
 
     def submit_plan(self, steps: List[str]) -> dict:
         """Submit the execution plan for the data pipeline."""
         return {"status": "success", "message": "Plan accepted", "planned_steps": steps}
 
-    def fetch_data(self, source: str, query: str) -> DataResponse:
-        """Fetches raw data. Simulates a 429 Rate Limit on the first attempt."""
-        self.fetch_attempts += 1
-        
-        if self.fetch_attempts == 1:
-            logger.warning("Simulating 429 Rate Limit Error")
-            return DataResponse(status="error", message="429 Too Many Requests from v2_api")
-        
-        raw_data = [
-            {"region": "North", "sales": 15000, "status": "clean"},
-            {"region": "South", "sales": 12000, "status": "clean"},
-            {"region": "East", "sales": "ERROR_NAN", "status": "corrupt"}
-        ]
-        return DataResponse(status="success", data=raw_data)
-
     def _peel_data(self, input_val: Any) -> list:
-        """Internal helper to extract a list of data from wrapped LLM inputs."""
+        """Internal helper to extract data from LLM outputs."""
         try:
-            # If it's a string, try to parse it
             data = json.loads(input_val) if isinstance(input_val, str) else input_val
-            
-            # If the LLM passed the whole response dictionary, grab just the 'data' part
             if isinstance(data, dict):
-                if "data" in data:
-                    return data["data"]
-                if "result" in data:
-                    return data["result"]
-            
-            # If it's already a list, we're good
-            if isinstance(data, list):
-                return data
-                
-            return []
+                return data.get("data") or data.get("result") or []
+            return data if isinstance(data, list) else []
         except:
             return []
 
-    def transform_data(self, raw_data_json: str, strategy: str) -> DataResponse:
-        """Cleans data using pandas based on a strategy."""
+    # --- Workspace Awareness Tool ---
+    def list_files(self) -> dict:
+        """Lists all files available in the current workspace directory."""
         try:
-            # Peel the data out of potential wrappers
+            files = os.listdir("/app")
+            return {"status": "success", "files": files}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    # --- NEW: Database Schema Tool ---
+    def get_db_schema(self, db_name: str) -> SchemaResponse:
+        """
+        Returns the table names and column names for a given SQLite database.
+        Use this if you are unsure about table or column names before querying.
+        """
+        db_path = f"/app/{db_name}"
+        if not os.path.exists(db_path):
+            return SchemaResponse(status="error", message=f"Database {db_name} not found.")
+        
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            # Get all table names
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            db_schema = {}
+            for table in tables:
+                # Get column names for each table
+                cursor.execute(f"PRAGMA table_info({table});")
+                db_schema[table] = [row[1] for row in cursor.fetchall()]
+            
+            conn.close()
+            return SchemaResponse(status="success", schema=db_schema)
+        except Exception as e:
+            return SchemaResponse(status="error", message=f"Could not read schema: {str(e)}")
+
+    # --- Vision Tool ---
+    def analyze_image(self, image_file_name: str, prompt: str = "Describe this image and extract any relevant data.") -> AnalysisResponse:
+        """Processes an image file uploaded to the workspace using Vision AI."""
+        file_path = f"/app/{image_file_name}"
+        
+        if not os.path.exists(file_path):
+            return AnalysisResponse(status="error", message=f"File {image_file_name} not found in workspace.")
+
+        try:
+            with open(file_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+            response = self.client.chat.completions.create(
+                model="openai/gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                        ],
+                    }
+                ],
+            )
+            return AnalysisResponse(status="success", analysis=response.choices[0].message.content)
+        except Exception as e:
+            return AnalysisResponse(status="error", message=str(e))
+
+    # --- Database Tool ---
+    def query_custom_db(self, db_name: str, query: str) -> DataResponse:
+        """
+        Executes a SQL query on a user-uploaded SQLite database file.
+        Use this when the user asks to analyze a .db or .sqlite file.
+        """
+        db_path = f"/app/{db_name}"
+        
+        if not os.path.exists(db_path):
+            return DataResponse(
+                status="error", 
+                message=f"File '{db_name}' not found. Ensure it was uploaded to the /app directory."
+            )
+
+        try:
+            conn = sqlite3.connect(db_path)
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            return DataResponse(status="success", data=df.to_dict(orient="records"))
+        except Exception as e:
+            return DataResponse(status="error", message=f"DB Error: {str(e)}")
+
+    # --- Dynamic Transformation Tool ---
+    def transform_data(self, raw_data_json: str, strategy: str, target_column: str = "sales") -> DataResponse:
+        """Cleans data using pandas. Specify 'target_column' (e.g. 'price' or 'sales') to clean."""
+        try:
             data_list = self._peel_data(raw_data_json)
-            if not data_list:
-                return DataResponse(status="error", message="Could not find valid data list in input")
-
             df = pd.DataFrame(data_list)
             
-            if strategy == "drop_corrupt":
-                # Ensure sales is numeric and drop the NaNs created by ERROR_NAN
-                df['sales'] = pd.to_numeric(df['sales'], errors='coerce')
-                df = df.dropna(subset=['sales'])
+            if strategy == "drop_corrupt" and not df.empty:
+                if target_column in df.columns:
+                    df[target_column] = pd.to_numeric(df[target_column], errors='coerce')
+                    df = df.dropna(subset=[target_column])
+                else:
+                    return DataResponse(status="error", message=f"Column '{target_column}' not found in data.")
             
-            clean_json = df.to_json(orient="records")
-            return DataResponse(status="success", data=json.loads(clean_json))
+            return DataResponse(status="success", data=df.to_dict(orient="records"))
         except Exception as e:
-            logger.error(f"Pandas transformation failed: {e}")
-            return DataResponse(status="error", message=f"Pandas transformation failed: {str(e)}")
+            return DataResponse(status="error", message=str(e))
 
-    def generate_chart(self, transformed_data_json: str, chart_type: str) -> ChartResponse:
-        """Generates a real PNG chart using matplotlib."""
+    # --- Dynamic Chart Tool ---
+    def generate_chart(self, transformed_data_json: str, chart_type: str, x_axis: str = "region", y_axis: str = "sales") -> ChartResponse:
+        """Generates a chart. Specify 'x_axis' and 'y_axis' columns (e.g. x_axis='timestamp', y_axis='price')."""
         try:
-            # Peel the data out of potential wrappers
             data_list = self._peel_data(transformed_data_json)
-            if not data_list:
-                return ChartResponse(status="error", message="No data available to generate chart")
-
             df = pd.DataFrame(data_list)
             
-            plt.figure(figsize=(8, 6))
+            if x_axis not in df.columns or y_axis not in df.columns:
+                return ChartResponse(status="error", message=f"Required columns '{x_axis}' or '{y_axis}' missing.")
+
+            plt.figure(figsize=(10, 6))
             if chart_type.lower() == "bar":
-                plt.bar(df['region'], df['sales'], color='skyblue')
+                plt.bar(df[x_axis], df[y_axis], color='skyblue')
             elif chart_type.lower() == "pie":
-                plt.pie(df['sales'], labels=df['region'], autopct='%1.1f%%')
-            else:
-                return ChartResponse(status="error", message=f"Unsupported chart: {chart_type}")
-
-            plt.title(f"Sales Distribution ({chart_type.title()})")
+                plt.pie(df[y_axis], labels=df[x_axis], autopct='%1.1f%%')
             
-            # Explicit path to ensure it lands in the mapped volume
-            file_path = "/app/pipeline_chart.png"
-            plt.savefig(file_path)
+            plt.title(f"{y_axis.title()} by {x_axis.title()}")
+            plt.xticks(rotation=45) 
+            plt.tight_layout()
+            
+            file_name = "output_chart.png"
+            plt.savefig(f"/app/{file_name}")
             plt.close()
-
-            logger.info(f"Chart successfully saved to {file_path}")
-            return ChartResponse(status="success", chart_url="pipeline_chart.png")
+            return ChartResponse(status="success", chart_url=file_name)
         except Exception as e:
-            logger.error(f"Matplotlib failed: {e}")
-            return ChartResponse(status="error", message=f"Matplotlib failed: {str(e)}")
-
-    def compose_report(self, summary_text: str, chart_url: str) -> ReportResponse:
-        """Composes a markdown report."""
-        report = f"# Pipeline Summary Report\n\n{summary_text}\n\n![Chart]({chart_url})"
-        return ReportResponse(status="success", report_content=report)
-
-    def dispatch_email(self, report_content: str, recipient: str) -> EmailResponse:
-        """Simulates sending the report via email."""
-        logger.info(f"Emailing report to {recipient}")
-        return EmailResponse(status="success", message=f"Email successfully sent to {recipient}")
+            return ChartResponse(status="error", message=str(e))
 
     def request_human_input(self, reason: str, question: str) -> HumanInputResponse:
         """Pauses the workflow to ask the user a question."""
         return HumanInputResponse(status="paused", reason=reason, question=question)
 
-    def escalate(self, reason: str, failed_step: str) -> dict:
-        """Halt the workflow and notify the user of a critical failure."""
-        return {"status": "escalated", "message": f"Workflow halted at {failed_step}: {reason}"}
-
 def get_tools():
     ts = DataPipelineToolset()
     return {
         "submit_plan": ts.submit_plan,
-        "fetch_data": ts.fetch_data,
+        "list_files": ts.list_files,
+        "get_db_schema": ts.get_db_schema,
+        "analyze_image": ts.analyze_image,
+        "query_custom_db": ts.query_custom_db,
         "transform_data": ts.transform_data,
         "generate_chart": ts.generate_chart,
-        "compose_report": ts.compose_report,
-        "dispatch_email": ts.dispatch_email,
-        "request_human_input": ts.request_human_input,
-        "escalate": ts.escalate
+        "request_human_input": ts.request_human_input
     }
