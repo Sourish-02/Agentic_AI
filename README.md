@@ -1,3 +1,5 @@
+## Adaptive Workflow Orchestrative Agent (Data Pipeline & Report Delivery)
+
 Project Overview - This project is a fully functional autonomous Agent-to-Agent (A2A) service built on top of the provided template (Template 3). We have transformed it from a bare-bones placeholder into a production-ready Workspace Data Agent capable of receiving natural language instructions, executing multi-step data pipelines, and returning structured results. The agent is named the Data Pipeline Orchestrator. It connects to an OpenRouter-backed LLM (GPT-4o-mini), maintains persistent conversation sessions, and exposes eight specialized tools for data analysis, visualization, vision AI, and human-in-the-loop escalation.
 
 __main__.py        → boots the server, wires everything together
