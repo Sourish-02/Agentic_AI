@@ -83,6 +83,3 @@ Agency vs. Chatting
 •	The LLM: Can "hallucinate" and try to use tools that don't exist.
 •	Our Agent:  Our _extract_function_schema logic strictly defines what the agent can and cannot do. If it fails twice, the Escalation Tool forces it to stop. We have "Human-in-the-Loop" safety that a standard LLM lacks.
 
-TLDR- A standard LLM is a consultant: it tells you how to solve a problem. Our project is an operator, it actually executes the solution. We've given it the ability to handle real-world infrastructure failures, use professional data libraries like Pandas, and provide a persistent, self-healing workflow that a simple chat interface cannot achieve.
-
-
